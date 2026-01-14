@@ -45,19 +45,34 @@ fn wait_for_key() {
 fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
 
-    let patch_path: PathBuf = cwd.join("update.tgz");
+    // 参数多于一个时，报错
+    if std::env::args().len() > 2 {
+        eprintln!("用法错误: 仅接受一个参数，即补丁文件路径。用法: mc_updater <patch.tgz>");
+        wait_for_key();
+        std::process::exit(1);
+    }
+
+    let patch_path: PathBuf = std::env::args().nth(1).map(PathBuf::from).ok_or_else(|| {
+        eprintln!("未提供补丁文件路径。用法: mc_updater <patch.tgz>");
+        wait_for_key();
+        std::process::exit(1);
+    })?;
+
     if !patch_path.exists() {
         eprintln!("补丁文件未找到: {}", patch_path.display());
-        eprintln!("请把 update.tgz 放在当前目录后重试。");
         wait_for_key();
         std::process::exit(1);
     }
 
     let target_dir: PathBuf = cwd.join(".minecraft/versions/NeoForge/mods");
     if !target_dir.exists() {
-        println!("目标目录不存在，正在创建: {}", target_dir.display());
-        std::fs::create_dir_all(&target_dir)
-            .with_context(|| format!("无法创建目标目录: {}", target_dir.display()))?;
+        // 报错并退出
+        eprintln!(
+            "目标目录不存在: {}, 你真的在 minecraft 目录下吗？",
+            target_dir.display()
+        );
+        wait_for_key();
+        std::process::exit(1);
     }
 
     println!("使用补丁: {}", patch_path.display());
