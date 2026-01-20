@@ -44,6 +44,11 @@ use flate2::read::GzDecoder;
 use tar::Archive;
 use toml::Table;
 
+struct Patch {
+    path: PathBuf,
+    created_at: DateTime<Utc>,
+}
+
 fn wait_for_key() {
     print!("按回车退出...");
     let _ = io::stdout().flush();
@@ -68,35 +73,63 @@ where
     Ok(target_dir)
 }
 
+fn create_patch_list(args: Vec<PathBuf>) -> Result<Vec<Patch>> {
+    let mut patches: Vec<Patch> = Vec::new();
+
+    for patch in args {
+        if !patch.exists() {
+            bail!("补丁文件未找到: {}", patch.display())
+        }
+
+        let date = parse_create_time(&patch)?;
+        patches.push(Patch {
+            path: patch,
+            created_at: date,
+        });
+    }
+
+    Ok(patches)
+}
+
 fn parse_create_time(patch: &PathBuf) -> Result<DateTime<Utc>> {
     let file = std::fs::File::open(patch).context("文件打开失败")?;
-
     let gz = GzDecoder::new(file);
     let mut tar = Archive::new(gz);
 
     for entry in tar.entries()? {
         let mut entry = entry?;
 
-        if entry.path()?.file_name() == Some(OsStr::new("metadata.toml")) {
-            let mut s = String::new();
-            entry.read_to_string(&mut s)?;
-
-            let table = s.parse::<Table>()?;
-
-            let time_str = table
-                .get("created_at")
-                .and_then(|v| v.as_str())
-                .context("缺失 created_at 字段")?;
-
-            let dt: DateTime<Utc> = time_str
-                .parse::<DateTime<Utc>>()
-                .context("非法的时间格式")?;
-
-            return Ok(dt);
+        if entry.path()?.file_name() != Some(OsStr::new("metadata.toml")) {
+            continue;
         }
+
+        let mut s = String::new();
+        entry.read_to_string(&mut s)?;
+
+        let table: Table = s.parse()?;
+
+        let time_str = table
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .context("缺失 created_at 字段")?;
+
+        return time_str.parse::<DateTime<Utc>>().context("非法的时间格式");
     }
 
     bail!("数据包失效：无法找到 metadata.toml")
+}
+
+fn create_merge_tgz(patches: &Vec<Patch>, temp_dir: &PathBuf) -> Result<PathBuf> {
+    let (first, rest) = patches.split_first().context("补丁文件未找到")?;
+    let mut current = first.path.clone();
+
+    for (i, patch) in rest.iter().enumerate() {
+        let output = temp_dir.join(format!("merge_{}.tgz", i));
+        merge_patches(&current, &patch.path, &output)?;
+        current = output;
+    }
+
+    Ok(current)
 }
 
 fn run() -> Result<()> {
@@ -108,42 +141,14 @@ fn run() -> Result<()> {
         bail!("请拖入补丁包文件")
     }
 
-    let mut patches: Vec<(PathBuf, DateTime<Utc>)> = Vec::new();
+    let mut patches = create_patch_list(args)?;
 
-    for patch in args {
-        if !patch.exists() {
-            bail!("补丁文件未找到: {}", patch.display())
-        }
-
-        let date = parse_create_time(&patch)?;
-        patches.push((patch, date));
-    }
-
-    patches.sort_by_key(|&(_, date)| date);
+    patches.sort_by_key(|p| p.created_at);
 
     let merge_dir = std::env::temp_dir().join(format!("mc_updater_{}", std::process::id()));
     std::fs::create_dir_all(&merge_dir)?;
 
-    let mut merge_tgz: PathBuf = patches[0].0.clone();
-
-    if patches.len() > 1 {
-        let mut temp_tgz = merge_dir.join(format!("temp.tgz"));
-        merge_patches(&patches[0].0, &patches[1].0, &temp_tgz)?;
-
-        for (i, patch) in patches[2..].iter().enumerate() {
-            let output_tgz = merge_dir.join(format!("temp_{}.tgz", i));
-            merge_patches(&temp_tgz, &patch.0, &output_tgz)?;
-            temp_tgz = output_tgz;
-        }
-
-        merge_tgz = temp_tgz;
-    }
-
-    println!("目标目录: {}", target_dir.display());
-
-    for (path, _) in &patches {
-        println!("使用补丁: {}", path.display());
-    }
+    let merge_tgz = create_merge_tgz(&patches, &merge_dir)?;
 
     bin_diff_tool::patch::apply_patch(&target_dir, &merge_tgz)
         .with_context(|| format!("应用补丁失败: {}", merge_tgz.display()))?;
